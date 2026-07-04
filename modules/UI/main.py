@@ -12,8 +12,6 @@ with one poll check.
 
 import bpy
 
-from ..Core import prefs as _prefs
-
 
 # (identifier, button label, supported)
 GAMES = [
@@ -56,7 +54,7 @@ class XBG_OT_SelectGame(bpy.types.Operator):
 
 
 class XBG_PT_Panel(bpy.types.Panel):
-    """Root panel: update bar + game picker / per-game header."""
+    """Root panel: game picker / per-game header."""
     bl_label = "XBG Importer"
     bl_idname = "OBJECT_PT_xbg_import"
     bl_space_type = 'VIEW_3D'
@@ -69,30 +67,6 @@ class XBG_PT_Panel(bpy.types.Panel):
         game = active_game(ctx)
 
         if game == 'NONE':
-            # ── Update bar (only on the home screen) ────────────────────
-            if _prefs._update_status is None and _prefs._update_error is None:
-                l.operator("xbg.check_for_updates",
-                           text="Check for Updates", icon="FILE_REFRESH")
-            elif _prefs._update_error:
-                row = l.row()
-                row.label(text="Update check failed", icon="ERROR")
-                row.operator("xbg.check_for_updates", text="Retry",
-                             icon="FILE_REFRESH")
-            elif _prefs._update_status == "up_to_date":
-                row = l.row()
-                row.label(text="Plugin is up to date", icon="CHECKMARK")
-                row.operator("xbg.check_for_updates", text="",
-                             icon="FILE_REFRESH")
-            else:
-                box = l.box()
-                box.label(text="New changes are available", icon="INFO")
-                row = box.row()
-                row.operator("xbg.apply_update", text="Update Now",
-                             icon="IMPORT")
-                row.operator("xbg.check_for_updates", text="",
-                             icon="FILE_REFRESH")
-            l.separator()
-
             # ── Game picker ─────────────────────────────────────────────
             l.label(text="Select the game you wish to modify:",
                     icon='RESTRICT_SELECT_OFF')
