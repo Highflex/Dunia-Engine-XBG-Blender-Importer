@@ -211,6 +211,16 @@ class XBG_OT_ImportFC3Mab(bpy.types.Operator):
             mab_dir = os.path.dirname(mab_dir)
             extra.append(mab_dir)
 
+        # Optional manual override — otherwise apply_multi_bone auto-discovers
+        # a .skeleton file next to the XBG/mab via extra_dirs.
+        skeleton_override = (getattr(ds, 'mab_skeleton_override_fc3', '') or '').strip()
+        if skeleton_override:
+            skeleton_override = bpy.path.abspath(skeleton_override)
+            if not os.path.isfile(skeleton_override):
+                self.report({'ERROR'},
+                    "Skeleton override is set but not a file: %s" % skeleton_override)
+                return {'CANCELLED'}
+
         from .import_mab_fc3 import apply_single_bone
         try:
             d = open(self.filepath, 'rb').read()
@@ -218,7 +228,7 @@ class XBG_OT_ImportFC3Mab(bpy.types.Operator):
             try:
                 n_keyed, animated = apply_multi_bone(
                     ctx, d, sec, arm, xbg_path=xbg_path,
-                    skeleton_path=None, extra_dirs=extra,
+                    skeleton_path=skeleton_override or None, extra_dirs=extra,
                     emulate_helpers=ds.mab_emulate_helpers,
                     smooth_resample=ds.mab_smooth_resample,
                     resample_fps=ds.mab_resample_fps,
