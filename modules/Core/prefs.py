@@ -2,6 +2,8 @@
 
 Split out of the monolithic __init__.py (2026-06-09 refactor).
 """
+import hashlib
+import json
 import os
 import re
 import threading
@@ -25,15 +27,69 @@ def get_prefs(ctx):
 # repo itself (__init__.py + modules/), so there is NO file manifest anymore:
 # updates download the whole branch as a zip and sync it (new folders/scripts
 # in a release are picked up automatically — nothing to register here).
+_REPO_OWNER = "Quiet-Joker"
+_REPO_NAME = "Dunia-Engine-XBG-Blender-Importer"
 _REPO_BRANCH = "Dev"
-_RAW_BASE = ("https://raw.githubusercontent.com/Quiet-Joker/"
-             "Dunia-Engine-XBG-Blender-Importer/%s/" % _REPO_BRANCH)
-_ZIP_URL = ("https://github.com/Quiet-Joker/Dunia-Engine-XBG-Blender-Importer/"
-            "archive/refs/heads/%s.zip" % _REPO_BRANCH)
+_RAW_BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"
+             % (_REPO_OWNER, _REPO_NAME, _REPO_BRANCH))
+_ZIP_URL = ("https://github.com/%s/%s/archive/refs/heads/%s.zip"
+            % (_REPO_OWNER, _REPO_NAME, _REPO_BRANCH))
+# Git tree API: lists every file's git blob SHA for a branch in one small
+# JSON call — lets the checker diff actual source content (not the Releases
+# tab, which may lag behind the Dev branch) without downloading the full zip.
+_TREE_URL = ("https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1"
+             % (_REPO_OWNER, _REPO_NAME, _REPO_BRANCH))
 
 _update_status = None   # None = not checked, "up_to_date", or "vX.X.X available"
 _update_error  = None   # set if network fetch failed
 _startup_checked = False  # auto-check runs once per Blender session
+
+
+def _wanted_rel(rel):
+    """Which repo-relative paths belong inside the installed addon."""
+    return rel == "__init__.py" or rel.startswith("modules/")
+
+
+def _git_blob_sha(data):
+    """Git's blob hash: sha1("blob <len>\\0" + content) — matches the 'sha'
+    field the tree API reports for each file, so no download is needed to
+    compare against it."""
+    header = ("blob %d\0" % len(data)).encode("utf-8")
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _fetch_remote_tree():
+    """Fetch {relpath: blob_sha} for every addon file on the Dev branch."""
+    req = urllib.request.urlopen(_TREE_URL, timeout=10)
+    payload = json.loads(req.read().decode("utf-8", errors="ignore"))
+    out = {}
+    for entry in payload.get("tree", []):
+        if entry.get("type") != "blob":
+            continue
+        path = entry["path"]
+        if _wanted_rel(path):
+            out[path] = entry["sha"]
+    return out
+
+
+def _local_tree(plugin_dir):
+    """Fetch {relpath: blob_sha} for the currently installed addon files."""
+    out = {}
+    init_path = os.path.join(plugin_dir, "__init__.py")
+    if os.path.isfile(init_path):
+        with open(init_path, "rb") as f:
+            out["__init__.py"] = _git_blob_sha(f.read())
+    mod_dir = os.path.join(plugin_dir, "modules")
+    for dirpath, dirnames, filenames in os.walk(mod_dir):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            full = os.path.join(dirpath, fn)
+            rel = os.path.relpath(full, plugin_dir).replace(os.sep, "/")
+            with open(full, "rb") as f:
+                out[rel] = _git_blob_sha(f.read())
+    return out
 
 
 def _fetch_remote_version():
@@ -50,19 +106,40 @@ def _fetch_remote_version():
     return None
 
 
+def _addon_plugin_dir():
+    """this file lives in modules/Core/ — the addon root is two levels up."""
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 def _check_update_thread(silent=False):
     global _update_status, _update_error
-    remote = _fetch_remote_version()
-    if remote is None:
+    try:
+        remote_tree = _fetch_remote_tree()
+    except Exception:
         # On the automatic startup check, stay quiet about network failures
         # (offline users shouldn't see an error banner every launch).
         if not silent:
             _update_error = "Could not reach update server."
         return
-    import importlib
-    local = importlib.import_module(ADDON_ID).bl_info["version"]
-    if remote > local:
-        _update_status = f"v{remote[0]}.{remote[1]}.{remote[2]} available"
+
+    if not remote_tree:
+        if not silent:
+            _update_error = "Could not reach update server."
+        return
+
+    local_tree = _local_tree(_addon_plugin_dir())
+
+    # Any content difference — new file, removed file, or changed file —
+    # means the Dev branch source has actually moved on, regardless of
+    # whether bl_info's version tuple was bumped.
+    changed = remote_tree != local_tree
+
+    remote_version = _fetch_remote_version()
+    if changed:
+        if remote_version:
+            _update_status = f"v{remote_version[0]}.{remote_version[1]}.{remote_version[2]} available"
+        else:
+            _update_status = "Update available"
     else:
         _update_status = "up_to_date"
 
@@ -161,9 +238,7 @@ class XBG_OT_ApplyUpdate(bpy.types.Operator):
         import io
         import zipfile
 
-        # this file lives in modules/Core/ — the addon root is two levels up
-        plugin_dir = os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))))
+        plugin_dir = _addon_plugin_dir()
 
         # ── 1. download the WHOLE branch as one zip (no file manifest —
         #       new folders/scripts added upstream are picked up automatically)
@@ -179,10 +254,6 @@ class XBG_OT_ApplyUpdate(bpy.types.Operator):
         names = zf.namelist()
         root = names[0].split('/')[0] + '/' if names else ''
 
-        def wanted(rel):
-            """Which repo files belong inside the installed addon."""
-            return rel == "__init__.py" or rel.startswith("modules/")
-
         # ── 2. extract into the addon folder
         remote_files = set()
         written = 0
@@ -191,7 +262,7 @@ class XBG_OT_ApplyUpdate(bpy.types.Operator):
             if not n.startswith(root) or n.endswith('/'):
                 continue
             rel = n[len(root):]
-            if not wanted(rel):
+            if not _wanted_rel(rel):
                 continue
             remote_files.add(rel)
             dest = os.path.join(plugin_dir, rel.replace('/', os.sep))
