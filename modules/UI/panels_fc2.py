@@ -570,6 +570,8 @@ class XBG_PT_SceneViewerPanelFC2(bpy.types.Panel):
         b.prop(ds, "mab_emulate_helpers")
         if ds.mab_emulate_helpers:
             b.prop(ds, "mab_twist_bake")
+        b.prop(ds, "mab_apply_root_motion")
+        b.prop(ds, "mab_apply_bone_translation")
         b.prop(ds, "mab_smooth_resample")
         if ds.mab_smooth_resample:
             b.prop(ds, "mab_resample_fps")
@@ -577,6 +579,9 @@ class XBG_PT_SceneViewerPanelFC2(bpy.types.Panel):
         r.scale_y = 1.4
         r.operator("xbg.import_mab_animation_fc2",
                    text="Import MAB Animation", icon='ARMATURE_DATA')
+        b.operator("xbg.create_fc2_bone_camera",
+                   text="Create 75 FOV Camera on Camera Bone",
+                   icon='OUTLINER_OB_CAMERA')
         b.operator("xbg.preview_jiggle_fc2",
                    text="Preview Jiggle (procedural bones)", icon='PHYSICS')
 
