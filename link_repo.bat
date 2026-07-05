@@ -1,0 +1,1 @@
+mklink /J "%APPDATA%\Blender Foundation\Blender\5.1\scripts\addons\Dunia-Engine-XBG-Blender-Importer" "C:\Projects\Dunia-Engine-XBG-Blender-Importer"
