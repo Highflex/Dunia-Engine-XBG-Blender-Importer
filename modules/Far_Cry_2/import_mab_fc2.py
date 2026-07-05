@@ -466,20 +466,22 @@ def apply_single_bone(context, d, sections, arm_obj, bone_name,
         if prev is not None and prev.dot(qq) < 0:
             qq = Quat((-qq.w, -qq.x, -qq.y, -qq.z))
         prev = qq
-        frames.append(frame_idx + 1)
+        frames.append(frame_idx)
         quats.append(rest_inv @ qq)         # keyed value == old pb.rotation_quaternion
-        last_frame = max(last_frame, frame_idx + 1)
+        last_frame = max(last_frame, frame_idx)
     if frames:
         _bulk_key_pose(action, pb, frames, quats)   # rotation only (locs=None)
 
     scene = context.scene
-    scene.frame_start = 1
-    scene.frame_end = max(2, last_frame)
+    scene.frame_start = 0
+    scene.frame_end = max(1, last_frame)
+    scene.frame_set(scene.frame_start)
     if fps:
         scene.render.fps = fps
     elif sections.animlen > 0:
         try:
-            scene.render.fps = max(1, round(last_frame / sections.animlen))
+            scene.render.fps = _fps_from_frame_range(
+                scene.frame_start, scene.frame_end, sections.animlen)
         except Exception:
             pass
     bpy.ops.object.mode_set(mode='OBJECT')
@@ -720,6 +722,29 @@ def _stream_counts(d, sections):
         if not (0 <= rr_count < 4096):
             rr_count = 0
     return tc, rr_count
+
+
+def _keyframe_frame_count(d, sections):
+    """Return the keyframe section frame/sample count, or 0 if unavailable."""
+    kf = sections.offsets.get('Keyframes', 0)
+    if not kf or kf + 4 > len(d):
+        return 0
+    return struct.unpack_from('<H', d, kf + 2)[0]
+
+
+def _trim_samples_to_frame(samples, max_frame):
+    """Drop terminal samples beyond the visible keyframe timeline."""
+    if max_frame is None or max_frame < 0:
+        return samples
+    return [(fr, value) for fr, value in samples if fr <= max_frame]
+
+
+def _fps_from_frame_range(frame_start, frame_end, animlen):
+    """Convert a 1-based Blender frame range to FPS using frame intervals."""
+    if animlen <= 0:
+        return None
+    intervals = max(1, int(frame_end) - int(frame_start))
+    return max(1, round(intervals / animlen))
 
 
 # FC2 MAB header: per-clip routing bitmasks over the ANIMATION SKELETON's
@@ -1045,7 +1070,7 @@ def _bulk_key_pose(action, pb, frames, quats, locs=None):
     fcurves in one bulk pass via foreach_set, instead of per-frame
     keyframe_insert().
 
-    `frames` are 1-based frame numbers; `quats` are mathutils Quaternions (wxyz);
+    `frames` are Blender frame numbers; `quats` are mathutils Quaternions (wxyz);
     `locs` are mathutils Vectors, or None to key rotation only. Assumes the bone
     has no existing keys in this action (true on a fresh MAB import — each bone
     is keyed exactly once)."""
@@ -1065,6 +1090,22 @@ def _bulk_key_pose(action, pb, frames, quats, locs=None):
                 flat[2 * k + 1] = vals[k][ci]
             fc.keyframe_points.foreach_set('co', flat)
             fc.update()
+
+
+def _bulk_key_location(action, pb, frames, locs):
+    """Populate only a pose bone's location fcurves."""
+    cont = _fcurve_container(pb.id_data, action)
+    bp = pb.path_from_id()
+    n = len(frames)
+    for ci in range(3):
+        fc = cont.fcurves.new(f'{bp}.location', index=ci)
+        fc.keyframe_points.add(n)
+        flat = [0.0] * (2 * n)
+        for k in range(n):
+            flat[2 * k] = frames[k]
+            flat[2 * k + 1] = locs[k][ci]
+        fc.keyframe_points.foreach_set('co', flat)
+        fc.update()
 
 
 def _set_key_interpolation(action, obj, pb, prop_name, interpolation):
@@ -1234,6 +1275,8 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
         constant = [nm for bit, nm in zip(const_b, xbg_names) if bit]
         translated = find_translated_bones(d, sections, xbg_names)
     N, keys_by_idx = decode_full_keyframes(d, sections)
+    kf_frame_count = _keyframe_frame_count(d, sections)
+    visible_last_src_frame = kf_frame_count - 1 if kf_frame_count > 0 else None
 
     def local_mat(quat_wxyz, pos):
         return Mat.Translation(pos) @ Quat(quat_wxyz).to_matrix().to_4x4()
@@ -1299,6 +1342,10 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
         if cand_name in pbones:
             _, root_motion_rot_raw = decode_candidate_root_orientation(d, sections)
             _, root_motion_pos = decode_candidate_root_translation(d, sections)
+            root_motion_rot_raw = _trim_samples_to_frame(
+                root_motion_rot_raw, visible_last_src_frame)
+            root_motion_pos = _trim_samples_to_frame(
+                root_motion_pos, visible_last_src_frame)
             root_motion_rot = [(fr, quat_xyzw_to_blender(q))
                                for fr, q in root_motion_rot_raw if q is not None]
             if root_motion_rot or root_motion_pos:
@@ -1315,6 +1362,11 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             _info, static_values = decode_candidate_animated_translation_values(
                 d, sections)
             offset_tracks = [[(0, v)] for v in static_values]
+        else:
+            offset_tracks = [
+                _trim_samples_to_frame(track, visible_last_src_frame)
+                for track in offset_tracks
+            ]
         unresolved = []
         pelvis_for_camera_redirect = (_find_pelvis_bone_name(skel, pbones)
                                       if skel else None)
@@ -1417,7 +1469,7 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
     last_frame = 1
     ident = Mat.Identity(4)
 
-    def key_bone(nm, keys):
+    def key_bone(nm, keys, write_locs=True):
         """Pose + keyframe one bone.  keys = [(frame_0based, bq_wxyz), ...].
 
         IMPORTANT: matrix_basis carries BOTH the delta rotation and a
@@ -1459,10 +1511,10 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             if prev is not None and prev.dot(qq) < 0.0:
                 qq.negate()
             prev = qq
-            frames.append(frame + 1)
+            frames.append(frame)
             quats.append(qq)
             locs.append(loc)
-        _bulk_key_pose(action, pb, frames, quats, locs)
+        _bulk_key_pose(action, pb, frames, quats, locs if write_locs else None)
         last_frame = max(last_frame, frames[-1])
         return True
 
@@ -1528,35 +1580,13 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             if prev is not None and prev.dot(qq) < 0.0:
                 qq.negate()
             prev = qq
-            frames.append(out_frame + 1)
+            frames.append(out_frame)
             quats.append(qq)
             locs.append(loc)
         _bulk_key_pose(action, pb, frames, quats, locs)
         _set_key_interpolation(action, arm_obj, pb, 'location', 'LINEAR')
         last_frame = max(last_frame, frames[-1])
         return True
-
-    def eval_wxyz_keys(rot_keys, frame, default_q):
-        if not rot_keys:
-            return default_q
-        if frame <= rot_keys[0][0]:
-            return rot_keys[0][1]
-        if frame >= rot_keys[-1][0]:
-            return rot_keys[-1][1]
-        for ri in range(len(rot_keys) - 1):
-            f0, q0 = rot_keys[ri]
-            f1, q1 = rot_keys[ri + 1]
-            if f0 <= frame <= f1:
-                if f1 <= f0:
-                    return q0
-                t = (frame - f0) / float(f1 - f0)
-                a = Quat(q0)
-                b = Quat(q1)
-                if a.dot(b) < 0.0:
-                    b.negate()
-                qq = a.slerp(b, t)
-                return (qq.w, qq.x, qq.y, qq.z)
-        return rot_keys[-1][1]
 
     anim_index = {nm: bi for bi, nm in enumerate(animated)}
     anim_index_norm = {_norm_bone_name(nm): bi for bi, nm in enumerate(animated)}
@@ -1584,52 +1614,34 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
         rest_q = const_lookup.get(nm, const_lookup_norm.get(nkey, skel[i]['quat']))
         rest_pos = skel[i]['pos']
 
-        rot_keys = []
-        bi = anim_index.get(nm)
-        if bi is None:
-            bi = anim_index_norm.get(nkey)
-        if bi is not None:
-            rot_keys = [(fr, quat_xyzw_to_blender(q))
-                        for fr, q in keys_by_idx.get(bi, []) if q is not None]
-            if rot_keys:
-                rot_keys = resample_rotation(rot_keys, mult)
-
         scale = float(max(1, mult))
-        if pos_samples:
+        if pos_samples and len(pos_samples) > 1:
             f0 = int(round(pos_samples[0][0] * scale))
             f1 = int(round(pos_samples[-1][0] * scale))
             out_frames = list(range(f0, f1 + 1)) if f1 >= f0 else [f0]
-        elif rot_keys:
-            out_frames = [fr for fr, _q in rot_keys]
+        elif pos_samples:
+            out_frames = [int(round(pos_samples[0][0] * scale))]
         else:
             return False
 
         pb = pbones[nm]
-        pb.rotation_mode = 'QUATERNION'
         frames = []
-        quats = []
         locs = []
-        prev = None
         for out_frame in out_frames:
             src_frame = out_frame / scale
-            q = eval_wxyz_keys(rot_keys, out_frame, rest_q)
             pos = _lerp_vec3_samples(pos_samples, src_frame)
             if pos is None:
                 pos = rest_pos
-            basis = mli_inv @ (bwp @ local_mat(q, pos) @ bw_inv) @ mli
-            loc, qq, _ = basis.decompose()
-            if prev is not None and prev.dot(qq) < 0.0:
-                qq.negate()
-            prev = qq
-            frames.append(out_frame + 1)
-            quats.append(qq)
+            basis = mli_inv @ (bwp @ local_mat(rest_q, pos) @ bw_inv) @ mli
+            loc, _qq, _ = basis.decompose()
+            frames.append(out_frame)
             locs.append(loc)
-        _bulk_key_pose(action, pb, frames, quats, locs)
+        _bulk_key_location(action, pb, frames, locs)
         _set_key_interpolation(action, arm_obj, pb, 'location', 'LINEAR')
         last_frame = max(last_frame, frames[-1])
         if frames:
             log_bone_translation(
-                "keyed translated bone %r: %d rot+loc keys, first_loc=%s "
+                "keyed translated bone %r: %d location keys, first_loc=%s "
                 "last_loc=%s"
                 % (nm, len(frames), tuple(locs[0]), tuple(locs[-1])))
         return True
@@ -1637,30 +1649,29 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
     if key_root_motion():
         keyed.add(root_motion_name)
 
+    translated_keyed = set()
     for nm, samples in bone_translation.items():
         if key_translated_bone(nm, samples):
             keyed.add(nm)
+            translated_keyed.add(nm)
 
     # Animated bones: full keyframe streams (track bi belongs to animated[bi]).
     for bi in range(min(N, len(animated))):
         if root_motion_name and animated[bi] == root_motion_name:
             continue
-        if animated[bi] in bone_translation:
-            continue
         keys = [(fr, quat_xyzw_to_blender(q))
                 for fr, q in keys_by_idx.get(bi, []) if q is not None]
         if mult > 1 and len(keys) >= 2:
             keys = resample_rotation(keys, mult)
-        if key_bone(animated[bi], keys):
+        if key_bone(animated[bi], keys,
+                    write_locs=(animated[bi] not in translated_keyed)):
             keyed.add(animated[bi])
 
-    # Constant bones: a single key at frame 1 holds the section[2] pose.
+    # Constant bones: a single key at frame 0 holds the section[2] pose.
     for nm, bq in const_bones:
         if root_motion_name and nm == root_motion_name:
             continue
-        if nm in bone_translation:
-            continue
-        if key_bone(nm, [(0, bq)]):
+        if key_bone(nm, [(0, bq)], write_locs=(nm not in translated_keyed)):
             keyed.add(nm)
 
     # ── Procedural-helper emulation (twist + elbow/knee correctives) ────
@@ -1698,7 +1709,7 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             keyed,
             log=print,
             bake=twist_bake, context=context,
-            frame_start=1, frame_end=last_frame)
+            frame_start=0, frame_end=last_frame)
 
     if bone_translation_log:
         arm_obj['mab_last_bone_translation'] = ' | '.join(bone_translation_log[-4:])
@@ -1710,11 +1721,13 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             "candidate bone translation: disabled")
 
     scene = context.scene
-    scene.frame_start = 1
-    scene.frame_end = max(2, last_frame)
+    scene.frame_start = 0
+    scene.frame_end = max(1, last_frame)
+    scene.frame_set(scene.frame_start)
     if sections.animlen > 0:
         try:
-            scene.render.fps = max(1, round(last_frame / sections.animlen))
+            scene.render.fps = _fps_from_frame_range(
+                scene.frame_start, scene.frame_end, sections.animlen)
         except Exception:
             pass
     bpy.ops.object.mode_set(mode='OBJECT')
