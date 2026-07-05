@@ -10,11 +10,18 @@
 //       UnkSec2 = Root translation / trajectory curve (vec3).
 //       Section[2] = Constant per-bone rotations selected by mask @0x10
 //                    (historically named RootRot; not root motion).
-//       Offsets = Pelvis/body local translation curve (vec3).
-//       UnkSec3 = small static/aux translation value table.
-//       Header mask @0x38 often routes the vec3 carrier to skeleton bone 17
-//       "Camera" even in third-person body clips; for Blender body playback
-//       the importer retargets that carrier to Pelvis.
+//       UnkSec3 = static routed bone translation values (vec3).
+//       Offsets = animated routed bone translation tracks (vec3).
+//       Header mask @0x38 routes UnkSec3/Offsets tracks to skeleton bones.
+//       Some clips have one Camera-routed carrier; weapon upper-body clips can
+//       have separate Pelvis + Camera static translation values.
+//   - Weapon animation sub-streams embedded in top-level UnkSec5:
+//       These are local animation containers for the weapon .skeleton order.
+//       They carry their own 20-byte masks, constant rotations, keyframes,
+//       translation/static vec3 data, plus optional secondary local streams
+//       referenced by the local offset table.
+//       Example: ak47 reload has local masks popcounts 6 const + 2 animated,
+//       exactly partitioning the 8 bones in ak47_ref.skeleton.
 //
 // Raw section offsets are relative to +0x10, matching import_mab_fc2.py.
 //------------------------------------------------
@@ -30,7 +37,7 @@ LittleEndian();
 //   purple = packed quaternion streams
 //   green  = root translation
 //   aqua   = keyframe rotation blocks
-//   red    = pelvis/body translation
+//   red    = routed bone translation
 
 typedef struct
 {
@@ -43,6 +50,21 @@ string ReadVec3(Vec3 &v)
 {
     local string s;
     SPrintf(s, "(%.6g, %.6g, %.6g)", v.x, v.y, v.z);
+    return s;
+}
+
+typedef struct
+{
+    float x <bgcolor=cLtPurple>;
+    float y <bgcolor=cLtPurple>;
+    float z <bgcolor=cLtPurple>;
+    float w <bgcolor=cLtPurple>;
+} FloatQuat <read=ReadFloatQuat>;
+
+string ReadFloatQuat(FloatQuat &q)
+{
+    local string s;
+    SPrintf(s, "(%.6g, %.6g, %.6g, %.6g)", q.x, q.y, q.z, q.w);
     return s;
 }
 
@@ -106,15 +128,15 @@ typedef struct
 
     Mask20 constantRotationMask <bgcolor=cLtYellow>;    // bit -> ConstantRot/section[2] entry
     Mask20 animatedRotationMask <bgcolor=cLtYellow>;    // bit -> Keyframes track, in skeleton order
-    Mask20 animatedTranslationCarrierMask <bgcolor=cYellow>; // usually bit 17 "Camera"; importer retargets to Pelvis
+    Mask20 animatedTranslationMask <bgcolor=cYellow>;        // bit -> UnkSec3/Offsets translation track
 
     ubyte  unknown4CTo83[0x84 - 0x4C] <bgcolor=cLtGray>;
     float  animLengthSeconds <bgcolor=cLtGreen>;
 
     int sectionRaw[9] <bgcolor=cLtGray>; // 0 RootTranslation(UnkSec2), 1 RootOrientation(UnkSec1),
                                          // 2 ConstantRot(historical RootRot), 3 Keyframes,
-                                         // 4 Static/AuxTranslation(UnkSec3),
-                                         // 5 PelvisBodyTranslation(Offsets),
+                                         // 4 StaticBoneTranslationValues(UnkSec3),
+                                         // 5 AnimatedBoneTranslationTracks(Offsets),
                                          // 6 Events, 7 UnkSec4, 8 UnkSec5
 } MabHeader;
 
@@ -133,7 +155,8 @@ typedef struct(int sectionSize)
     if (sampleCount <= 0 || sampleCount > maxSamples)
         sampleCount = maxSamples;
 
-    PackedQuat samples[sampleCount] <bgcolor=cLtPurple>;
+    if (sampleCount > 0)
+        PackedQuat samples[sampleCount] <bgcolor=cLtPurple>;
 
     tail = (int)(start + sectionSize - FTell());
     if (tail > 0)
@@ -155,12 +178,43 @@ typedef struct(int sectionSize)
     if (sampleCount <= 0 || sampleCount > maxSamples)
         sampleCount = maxSamples;
 
-    Vec3 samples[sampleCount] <bgcolor=cLtGreen>;
+    if (sampleCount > 0)
+        Vec3 samples[sampleCount] <bgcolor=cLtGreen>;
 
     tail = (int)(start + sectionSize - FTell());
     if (tail > 0)
         ubyte padding[tail] <bgcolor=cLtGray>;
 } Vec3Curve;
+
+typedef struct(int sectionSize)
+{
+    local int64 start;
+    local int frameSampleCount;
+    local int totalSampleCount;
+    local int maxSamples;
+    local int trackCount;
+    local int tail;
+
+    start = FTell();
+    CurveHeader header <bgcolor=cLtGray>;
+
+    trackCount = header.trackCount;
+    if (trackCount <= 0)
+        trackCount = 1;
+
+    frameSampleCount = header.frameCount + 1; // movement curves include terminal sample
+    maxSamples = (sectionSize - 8) / 12;
+    totalSampleCount = frameSampleCount * trackCount;
+    if (totalSampleCount <= 0 || totalSampleCount > maxSamples)
+        totalSampleCount = maxSamples;
+
+    if (totalSampleCount > 0)
+        Vec3 samples[totalSampleCount] <bgcolor=cLtGreen>;
+
+    tail = (int)(start + sectionSize - FTell());
+    if (tail > 0)
+        ubyte padding[tail] <bgcolor=cLtGray>;
+} Vec3TrackCurve;
 
 typedef struct(int sectionSize)
 {
@@ -171,7 +225,8 @@ typedef struct(int sectionSize)
     start = FTell();
     int count <bgcolor=cLtGray>;
     int pad0 <bgcolor=cLtGray>;
-    PackedQuat rotation[count] <bgcolor=cLtBlue>;
+    if (count > 0)
+        PackedQuat rotation[count] <bgcolor=cLtBlue>;
 
     tail = (int)(start + sectionSize - FTell());
     if (tail > 0)
@@ -187,17 +242,20 @@ typedef struct(uint trackCount, int blockSize)
     local int tail;
 
     start = FTell();
-    PackedQuat primary[trackCount] <bgcolor=cLtAqua>;     // sub-frame 0 for each animated bone
+    if (trackCount > 0)
+        PackedQuat primary[trackCount] <bgcolor=cLtAqua>; // sub-frame 0 for each animated bone
 
     maskBytes = (trackCount + 1) & ~1;  // even-rounded byte mask table
-    ubyte subframeMask[maskBytes] <bgcolor=cYellow>;      // bit 7 is primary, bits 6..0 are sf 1..7
+    if (maskBytes > 0)
+        ubyte subframeMask[maskBytes] <bgcolor=cYellow>;  // bit 7 is primary, bits 6..0 are sf 1..7
 
     secondaryBytes = blockSize - (6 * trackCount) - maskBytes;
     if (secondaryBytes < 0)
         secondaryBytes = 0;
     secondaryCount = secondaryBytes / 6;
 
-    PackedQuat secondary[secondaryCount] <bgcolor=cLtPurple>;
+    if (secondaryCount > 0)
+        PackedQuat secondary[secondaryCount] <bgcolor=cLtPurple>;
 
     tail = (int)(start + blockSize - FTell());
     if (tail > 0)
@@ -238,7 +296,8 @@ typedef struct(int sectionSize)
     start = FTell();
     uint count <bgcolor=cLtGray>;
     uint pad0 <bgcolor=cLtGray>;
-    Vec3 values[count] <bgcolor=cYellow>;
+    if (count > 0)
+        Vec3 values[count] <bgcolor=cYellow>;
 
     tail = (int)(start + sectionSize - FTell());
     if (tail > 0)
@@ -247,8 +306,201 @@ typedef struct(int sectionSize)
 
 typedef struct(int sectionSize)
 {
-    ubyte data[sectionSize] <bgcolor=cLtGray>;
+    if (sectionSize > 0)
+        ubyte data[sectionSize] <bgcolor=cLtGray>;
 } RawSection;
+
+typedef struct(int payloadSize)
+{
+    local int64 start;
+    local int i, j;
+    local int nextRel;
+    local int sectionRel[8];
+    local int sectionSize[8];
+
+    start = FTell();
+
+    Mask20 constantRotationMask <bgcolor=cLtYellow>;
+    Mask20 animatedRotationMask <bgcolor=cLtYellow>;
+    Mask20 staticTranslationMask <bgcolor=cYellow>;
+    Mask20 animatedTranslationMask <bgcolor=cYellow>;
+
+    FloatQuat referenceRotationA <bgcolor=cLtPurple>;
+    FloatQuat referenceRotationB <bgcolor=cLtPurple>;
+    uint unknown70 <bgcolor=cLtGray>;
+    float animLengthSeconds <bgcolor=cLtGreen>;
+    uint unknown78 <bgcolor=cLtGray>;
+    uint unknown7C <bgcolor=cLtGray>;
+
+    uint sectionRaw[8] <bgcolor=cLtGray>;
+
+    for (i = 0; i < 8; i++)
+    {
+        sectionRel[i] = 0;
+        sectionSize[i] = 0;
+        if (sectionRaw[i] > 0 && sectionRaw[i] <= payloadSize)
+        {
+            sectionRel[i] = sectionRaw[i];
+            nextRel = payloadSize;
+            for (j = 0; j < 8; j++)
+                if (sectionRaw[j] > sectionRaw[i] &&
+                    sectionRaw[j] < nextRel)
+                    nextRel = sectionRaw[j];
+            sectionSize[i] = nextRel - sectionRaw[i];
+        }
+    }
+
+    if (sectionRel[0] > 0 && sectionSize[0] > 0)
+    {
+        FSeek(start + sectionRel[0]);
+        ConstantRotSection LocalConstantRot(sectionSize[0]) <bgcolor=cLtBlue>;
+    }
+
+    if (sectionRel[1] > 0 && sectionSize[1] > 0)
+    {
+        FSeek(start + sectionRel[1]);
+        KeyframesSection LocalKeyframes(sectionSize[1]) <bgcolor=cLtAqua>;
+    }
+
+    if (sectionRel[2] > 0 && sectionSize[2] > 0)
+    {
+        FSeek(start + sectionRel[2]);
+        StaticTranslationValues LocalStaticTranslationValues(sectionSize[2]) <bgcolor=cYellow>;
+    }
+
+    if (sectionRel[3] > 0 && sectionSize[3] > 0)
+    {
+        FSeek(start + sectionRel[3]);
+        Vec3TrackCurve LocalAnimatedTranslationTracks(sectionSize[3]) <bgcolor=cLtRed>;
+    }
+
+    if (sectionRel[4] > 0 && sectionSize[4] > 0)
+    {
+        FSeek(start + sectionRel[4]);
+        RawSection LocalUnknown4_raw(sectionSize[4]) <bgcolor=cLtGray>;
+    }
+
+    if (sectionRel[5] > 0 && sectionSize[5] > 0)
+    {
+        FSeek(start + sectionRel[5]);
+        RawSection LocalUnknown5_raw(sectionSize[5]) <bgcolor=cLtGray>;
+    }
+
+    if (sectionRel[6] > 0 && sectionSize[6] > 0)
+    {
+        FSeek(start + sectionRel[6]);
+        RawSection LocalUnknown6_raw(sectionSize[6]) <bgcolor=cLtGray>;
+    }
+
+    if (sectionRel[7] > 0 && sectionSize[7] > 0)
+    {
+        FSeek(start + sectionRel[7]);
+        RawSection LocalUnknown7_raw(sectionSize[7]) <bgcolor=cLtGray>;
+    }
+
+    FSeek(start + payloadSize);
+} WeaponSecondarySubAnimation;
+
+typedef struct(int payloadSize)
+{
+    local int64 start;
+    local int i, j;
+    local int nextRel;
+    local int sectionRel[8];
+    local int sectionSize[8];
+
+    start = FTell();
+
+    Mask20 constantRotationMask <bgcolor=cLtYellow>; // local weapon .skeleton order
+    Mask20 animatedRotationMask <bgcolor=cLtYellow>;
+    Mask20 staticTranslationMask <bgcolor=cYellow>;
+    Mask20 animatedTranslationMask <bgcolor=cYellow>;
+
+    FloatQuat referenceRotationA <bgcolor=cLtPurple>;
+    FloatQuat referenceRotationB <bgcolor=cLtPurple>;
+    uint unknown70 <bgcolor=cLtGray>;
+    float animLengthSeconds <bgcolor=cLtGreen>;
+    uint unknown78 <bgcolor=cLtGray>;
+    uint unknown7C <bgcolor=cLtGray>;
+
+    uint sectionRaw[8] <bgcolor=cLtGray>; // relative to this weapon-subanim start:
+                                         // 0 ConstantRot, 1 Keyframes,
+                                         // 2 StaticTranslationValues,
+                                         // 3 AnimatedTranslationTracks,
+                                         // 6/7 optional secondary local streams
+
+    for (i = 0; i < 8; i++)
+    {
+        sectionRel[i] = 0;
+        sectionSize[i] = 0;
+        if (sectionRaw[i] > 0 && sectionRaw[i] <= payloadSize)
+        {
+            sectionRel[i] = sectionRaw[i];
+            nextRel = payloadSize;
+            for (j = 0; j < 8; j++)
+                if (sectionRaw[j] > sectionRaw[i] &&
+                    sectionRaw[j] < nextRel)
+                    nextRel = sectionRaw[j];
+            sectionSize[i] = nextRel - sectionRaw[i];
+        }
+    }
+
+    if (sectionRel[0] > 0 && sectionSize[0] > 0)
+    {
+        FSeek(start + sectionRel[0]);
+        ConstantRotSection LocalConstantRot(sectionSize[0]) <bgcolor=cLtBlue>;
+    }
+
+    if (sectionRel[1] > 0 && sectionSize[1] > 0)
+    {
+        FSeek(start + sectionRel[1]);
+        KeyframesSection LocalKeyframes(sectionSize[1]) <bgcolor=cLtAqua>;
+    }
+
+    if (sectionRel[2] > 0 && sectionSize[2] > 0)
+    {
+        FSeek(start + sectionRel[2]);
+        StaticTranslationValues LocalStaticTranslationValues(sectionSize[2]) <bgcolor=cYellow>;
+    }
+
+    if (sectionRel[3] > 0 && sectionSize[3] > 0)
+    {
+        FSeek(start + sectionRel[3]);
+        Vec3TrackCurve LocalAnimatedTranslationTracks(sectionSize[3]) <bgcolor=cLtRed>;
+    }
+
+    if (sectionRel[4] > 0 && sectionSize[4] > 0)
+    {
+        FSeek(start + sectionRel[4]);
+        RawSection LocalUnknown4_raw(sectionSize[4]) <bgcolor=cLtGray>;
+    }
+
+    if (sectionRel[5] > 0 && sectionSize[5] > 0)
+    {
+        FSeek(start + sectionRel[5]);
+        RawSection LocalUnknown5_raw(sectionSize[5]) <bgcolor=cLtGray>;
+    }
+
+    if (sectionRel[6] > 0 && sectionSize[6] > 0)
+    {
+        FSeek(start + sectionRel[6]);
+        if (sectionSize[6] >= 0xA0)
+            WeaponSecondarySubAnimation SecondaryWeaponSubAnimation6(sectionSize[6]) <bgcolor=cLtPurple>;
+        else
+            RawSection LocalUnknown6_raw(sectionSize[6]) <bgcolor=cLtGray>;
+    }
+
+    if (sectionRel[7] > 0 && sectionSize[7] > 0)
+    {
+        FSeek(start + sectionRel[7]);
+        if (sectionSize[7] >= 0xA0)
+            WeaponSecondarySubAnimation SecondaryWeaponSubAnimation7(sectionSize[7]) <bgcolor=cLtPurple>;
+        else
+            RawSection LocalUnknown7_raw(sectionSize[7]) <bgcolor=cLtGray>;
+    }
+
+    FSeek(start + payloadSize);
+} WeaponSubAnimation;
 
 MabHeader Header <bgcolor=cLtGray>;
 
@@ -308,13 +560,13 @@ if (sectionAbs[3] > 0)
 if (sectionAbs[4] > 0)
 {
     FSeek(sectionAbs[4]);
-    StaticTranslationValues UnkSec3_StaticOrAuxTranslationValues(sectionSize[4]) <bgcolor=cYellow>;
+    StaticTranslationValues UnkSec3_StaticBoneTranslationValues(sectionSize[4]) <bgcolor=cYellow>;
 }
 
 if (sectionAbs[5] > 0)
 {
     FSeek(sectionAbs[5]);
-    Vec3Curve Offsets_PelvisBodyTranslation(sectionSize[5]) <bgcolor=cLtRed>;
+    Vec3TrackCurve Offsets_AnimatedBoneTranslationTracks(sectionSize[5]) <bgcolor=cLtRed>;
 }
 
 if (sectionAbs[6] > 0)
@@ -329,8 +581,11 @@ if (sectionAbs[7] > 0)
     RawSection UnkSec4_raw(sectionSize[7]) <bgcolor=cLtGray>;
 }
 
-if (sectionAbs[8] > 0)
+if (sectionAbs[8] > 0 && sectionSize[8] > 0)
 {
     FSeek(sectionAbs[8]);
-    RawSection UnkSec5_raw(sectionSize[8]) <bgcolor=cLtGray>;
+    if (sectionSize[8] >= 0xA0)
+        WeaponSubAnimation UnkSec5_WeaponSubAnimation(sectionSize[8]) <bgcolor=cLtPurple>;
+    else
+        RawSection UnkSec5_raw(sectionSize[8]) <bgcolor=cLtGray>;
 }

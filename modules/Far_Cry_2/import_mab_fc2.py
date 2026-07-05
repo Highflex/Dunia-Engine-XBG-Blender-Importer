@@ -656,19 +656,24 @@ def decode_candidate_offsets(d, sections):
 
 
 def decode_candidate_offset_tracks(d, sections):
-    """Offsets candidate as routed vec3 tracks.
+    """Offsets candidate as routed animated vec3 tracks.
 
-    The FC2 movement clips observed so far have one translation track, stored
-    as frame_count+1 raw vec3 samples. If more tracks appear, this exposes them
-    in provisional frame-major order, matching the keyframe section's general
-    "all tracks for a frame" packing style.
+    FC2 body movement clips usually have one animated translation track, stored
+    as frame_count+1 raw vec3 samples. Weapon/body upper clips can instead put
+    only an empty/placeholder Offsets header here and store per-track static
+    values in UnkSec3; in that case this returns no tracks so callers can fall
+    back to decode_candidate_animated_translation_values().
     """
     header = _curve_header(d, sections, 'Offsets')
     if not header:
         return None, []
-    track_count = max(1, header['track_count'])
+    track_count = header['track_count']
+    if track_count <= 0:
+        return header, []
     frame_count = header['frame_count'] + 1
     max_vecs = max(0, header['size'] - 8) // 12
+    if max_vecs <= 0:
+        return header, []
     if frame_count <= 0:
         frame_count = max_vecs // track_count
     frame_count = min(frame_count, max_vecs // track_count)
@@ -1306,25 +1311,32 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
     bone_translation = {}
     if apply_bone_translation:
         _, offset_tracks = decode_candidate_offset_tracks(d, sections)
-        if not offset_tracks:
+        if not any(offset_tracks):
             _info, static_values = decode_candidate_animated_translation_values(
                 d, sections)
             offset_tracks = [[(0, v)] for v in static_values]
         unresolved = []
+        pelvis_for_camera_redirect = (_find_pelvis_bone_name(skel, pbones)
+                                      if skel else None)
+        pelvis_norm = (_norm_bone_name(pelvis_for_camera_redirect)
+                       if pelvis_for_camera_redirect else '')
+        has_direct_pelvis_translation = (
+            bool(pelvis_norm) and
+            any(_norm_bone_name(nm) == pelvis_norm for nm in translated))
         if translated and offset_tracks:
             for ti, nm in enumerate(translated):
                 if ti >= len(offset_tracks):
                     break
                 routed_nm = nm
                 if _norm_bone_name(nm) == 'camera':
-                    # FC2 body clips route the only vec3 translation track to
-                    # the Head child "Camera" even in third-person clips
-                    # (verified: pelvis_ref.skeleton bit 17 on 1stge/3rdge
-                    # fall and turn clips). For body playback in Blender,
-                    # retarget that view-carrier motion to Pelvis.
-                    pelvis = _find_pelvis_bone_name(skel, pbones)
-                    if pelvis:
-                        nm = pelvis
+                    # Some FC2 body clips route a single vec3 translation
+                    # carrier to the Head child "Camera"; for those, retarget
+                    # the carrier to Pelvis for body playback. Weapon upper
+                    # clips can route TWO static translation values (Pelvis
+                    # and Camera), so do not overwrite the explicit Pelvis
+                    # track when it is present.
+                    if pelvis_for_camera_redirect and not has_direct_pelvis_translation:
+                        nm = pelvis_for_camera_redirect
                         log_bone_translation(
                             "candidate bone translation: track %d routed to "
                             "'Camera'; redirecting to %r for body/pelvis "
@@ -1333,6 +1345,12 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
                     log_bone_translation(
                         "candidate bone translation: track %d routed to root "
                         "%r; skipped because root motion owns it" % (ti, nm))
+                    continue
+                if nm in bone_translation:
+                    log_bone_translation(
+                        "candidate bone translation: track %d routed to %r, "
+                        "but %r already has a translation track; preserving "
+                        "the first route" % (ti, routed_nm, nm))
                     continue
                 if (nm in pbones and
                         _skel_index_for_name(nm, name2idx, skel) is not None
