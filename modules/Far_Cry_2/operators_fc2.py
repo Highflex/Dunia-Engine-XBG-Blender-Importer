@@ -6,6 +6,7 @@ import os
 import re
 import struct
 import threading
+import math
 
 import bpy
 
@@ -1171,18 +1172,94 @@ class XBG_OT_ImportMABFC2(bpy.types.Operator):
                 skeleton_path=skel_override or None, extra_dirs=extra,
                 bone_offset=ds.mab_char_offset,
                 emulate_helpers=ds.mab_emulate_helpers,
+                apply_root_motion=ds.mab_apply_root_motion,
+                apply_bone_translation=ds.mab_apply_bone_translation,
                 smooth_resample=ds.mab_smooth_resample,
                 resample_fps=ds.mab_resample_fps,
                 twist_bake=ds.mab_twist_bake)
+            trans_status = str(arm.get('mab_last_bone_translation', '') or '')
+            if len(trans_status) > 180:
+                trans_status = trans_status[:177] + '...'
+            info_msg = (f"MAB: {os.path.basename(self.filepath)}  "
+                        f"{n_keyed}/{len(animated)} bones / "
+                        f"{ctx.scene.frame_end} frames")
+            if trans_status:
+                info_msg += " | " + trans_status
             self.report({'INFO'},
-                f"MAB: {os.path.basename(self.filepath)}  "
-                f"{n_keyed}/{len(animated)} bones / "
-                f"{ctx.scene.frame_end} frames")
+                info_msg)
             return {'FINISHED'}
         except Exception as exc:
             self.report({'ERROR'}, f"Failed to import .mab: {exc}")
             import traceback; traceback.print_exc()
             return {'CANCELLED'}
+
+
+class XBG_OT_CreateBoneCameraFC2(bpy.types.Operator):
+    """Create a 75-degree FOV camera constrained to the FC2 Camera bone."""
+    bl_idname = "xbg.create_fc2_bone_camera"
+    bl_label = "Create 75 FOV Camera"
+    bl_description = (
+        "Create a Blender camera, constrain it to the selected armature's "
+        "Camera bone, set FOV to 75 degrees, and make it the scene camera"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, ctx):
+        arm = ctx.active_object
+        if arm is None or arm.type != 'ARMATURE':
+            arm = next((o for o in ctx.selected_objects
+                        if o.type == 'ARMATURE'), None)
+        if arm is None:
+            self.report({'ERROR'}, "Select an armature with a Camera bone")
+            return {'CANCELLED'}
+
+        pbones = arm.pose.bones
+        bone_name = 'Camera' if 'Camera' in pbones else None
+        if bone_name is None:
+            for pb in pbones:
+                if pb.name.lower() == 'camera':
+                    bone_name = pb.name
+                    break
+        if bone_name is None:
+            self.report({'ERROR'}, "Selected armature has no Camera pose bone")
+            return {'CANCELLED'}
+
+        rig_obj = bpy.data.objects.new("FC2_CameraBone_Rig", None)
+        rig_obj.empty_display_type = 'ARROWS'
+        rig_obj.empty_display_size = 0.15
+        ctx.collection.objects.link(rig_obj)
+
+        cam_data = bpy.data.cameras.new("FC2_Camera_75FOV")
+        cam_data.angle = math.radians(75.0)
+        cam_data.display_size = 0.25
+        cam_obj = bpy.data.objects.new("FC2_Camera_75FOV", cam_data)
+        ctx.collection.objects.link(cam_obj)
+
+        pb = pbones[bone_name]
+        rig_obj.matrix_world = arm.matrix_world @ pb.matrix
+        con = rig_obj.constraints.new('COPY_TRANSFORMS')
+        con.name = "FC2 Camera bone"
+        con.target = arm
+        con.subtarget = bone_name
+        cam_obj.parent = rig_obj
+        cam_obj.location = (0.0, 0.0, 0.0)
+        cam_obj.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+        cam_obj.scale = (1.0, 1.0, 1.0)
+        cam_obj['fc2_camera_bone'] = bone_name
+        cam_obj['fc2_camera_fov_degrees'] = 75.0
+        cam_obj['fc2_camera_local_pitch_degrees'] = 90.0
+        rig_obj['fc2_camera_bone'] = bone_name
+
+        ctx.scene.camera = cam_obj
+        rig_obj.select_set(True)
+        cam_obj.select_set(True)
+        arm.select_set(True)
+        ctx.view_layer.objects.active = arm
+        self.report({'INFO'},
+                    "Created camera constrained to %s.%s at 75 deg FOV "
+                    "with +90 deg local pitch"
+                    % (arm.name, bone_name))
+        return {'FINISHED'}
 
 
 class XBG_OT_PreviewJiggleFC2(bpy.types.Operator):

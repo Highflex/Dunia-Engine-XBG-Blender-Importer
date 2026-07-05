@@ -50,6 +50,9 @@ _VERSION_LAYOUT = {
 }
 
 # buu342's 9-entry section order (note entries 0 and 1 are swapped in-file)
+# Historical name note:
+#   Section[2] was called "RootRot" in early tooling, but it is NOT root
+#   motion. It is the constant-rotation palette consumed by header mask 0x10.
 SECTION_LABELS = ['UnkSec2', 'UnkSec1', 'RootRot', 'Keyframes', 'UnkSec3',
                   'Offsets', 'Events', 'UnkSec4', 'UnkSec5']
 
@@ -184,31 +187,40 @@ def decode_keyframes(d, sections, expect_single_bone=False):
     """Decode the Rotation Keyframes section.
 
     Returns (header_info, [KeyGroup, ...]).
-    header_info = {'Nq', 'fc', 'magic_or_tc', 'lastoff', 'secsize', 'offsets'}.
+    header_info = {'Nq', 'fc', 'plus4', 'lastoff', 'secsize', 'offsets'}.
 
     Uses buu342's magic-float group-table for FC3; for FC2 the same +8 offset
-    table applies but the +4 field is the u32 track count (no magic float).
+    table applies, with +4 exposed neutrally as plus4/sample-rate-ish data.
     """
     kf = sections.offsets['Keyframes']
     n = len(d)
     Nq = struct.unpack_from('<H', d, kf)[0]
     fc = struct.unpack_from('<H', d, kf + 2)[0]
 
-    # FC3 stores a magic float at +4; FC2 stores u32 track count at +4.
+    # FC3 stores a magic float at +4; FC2 stores a u32 rate/unknown at +4.
     is_fc3 = sections.version_byte in (0x61, 0x62, 0x81, 0x82, 0xB0)
     if is_fc3:
         magic = struct.unpack_from('<f', d, kf + 4)[0]
         lastoff = ((int(magic * sections.animlen) >> 3) * 4) + 8
         plus4 = magic
     else:
-        plus4 = struct.unpack_from('<I', d, kf + 4)[0]  # track count
+        # Observed FC2 clips use this as a sample-rate-ish value (e.g. 31 for
+        # a 22-frame, 0.7s clip), while the u16 at +0 is the rotation-track
+        # count. Older notes called this a track count; keep the neutral name.
+        plus4 = struct.unpack_from('<I', d, kf + 4)[0]
         # group count from frame count: ((fc-1)>>3)+1 groups (+1 terminator)
         ngroups = ((max(1, fc) - 1) >> 3) + 1
         lastoff = 8 + ngroups * 4
 
     # Section size without padding is the i32 right after the last offset.
-    secsize = struct.unpack_from('<i', d, kf + lastoff + 4)[0] \
-        if kf + lastoff + 8 <= n else 0
+    if is_fc3:
+        secsize = struct.unpack_from('<i', d, kf + lastoff + 4)[0] \
+            if kf + lastoff + 8 <= n else 0
+    else:
+        # FC2 stores the section-data terminator as the last offset table
+        # entry itself: [block0, block1, ..., data_end].
+        secsize = struct.unpack_from('<i', d, kf + lastoff)[0] \
+            if kf + lastoff + 4 <= n else 0
 
     # Read the offset table (block boundaries) starting at kf+8.
     offsets = []
@@ -255,7 +267,7 @@ def decode_keyframes(d, sections, expect_single_bone=False):
 
 
 def decode_root_rotations(d, sections):
-    """Section[2] RootRot: i32 count, 4 pad, count × 6-byte quats."""
+    """Section[2] ConstantRot/RootRot: count + packed constant quats."""
     rr = sections.offsets['RootRot']
     n = len(d)
     if not (0 < rr + 8 <= n):
@@ -286,9 +298,9 @@ class XbgBone:
         # rotation stream, as written by the Dunia exporter.
         #   iB == -1  → bone is completely outside the MAB rotation stream
         #               (mesh-link nodes, world Root, attachment/Holster bones,
-        #                Camera bone).  Never animated, never in RootRot.
+        #                Camera bone).  Never animated, never in section[2].
         #   0 <= iB < mask_size  → bone participates: either keyframed (animated)
-        #               or constant (in RootRot), depending on the clip.
+        #               or constant (section[2]), depending on the clip.
         #   iB >= mask_size  → bone is always-procedural for this skeleton type
         #               (e.g. R Thumb02/03 and R arm twist bones on Kendra).
         #               mask_size = tc + rr_count, constant per skeleton.
@@ -414,6 +426,7 @@ def apply_single_bone(context, d, sections, arm_obj, bone_name,
         context.view_layer.objects.active = arm_obj
     if arm_obj.mode != 'POSE':
         bpy.ops.object.mode_set(mode='POSE')
+    _reset_armature_before_mab(arm_obj)
     if arm_obj.animation_data is None:
         arm_obj.animation_data_create()
     action = bpy.data.actions.new(name="MAB_" + bone_name)
@@ -474,20 +487,23 @@ def apply_single_bone(context, d, sections, arm_obj, bone_name,
 
 
 # ---------------------------------------------------------------------------
-# Multi-bone support (FC2 characters) — provisional but validated routing
+# Multi-bone support (FC2 characters) — validated mask routing
 # ---------------------------------------------------------------------------
 #
-# Routing model (see AGENTS.md MAB 2026-06-05): the MAB stores NO controller
-# IDs; tracks are in XBG NODE (skeleton) order.  RootRot (sec[2]) holds the
-# constant rest rotations of the NON-animated, non-identity bones (also XBG
-# order).  Therefore the animated bones for a clip are the first `tc` skeleton
-# bones (XBG order, excluding the leading mesh nodes) whose rest rotation is
-# NOT present in RootRot.
+# The MAB stores no per-key bone IDs. Routing comes from 20-byte bitmasks over
+# the animation .skeleton/LKS bone order:
+#   0x24 animated-rotation mask: keyframe track t = t-th set bit.
+#   0x10 constant-rotation mask: section[2] entry j = j-th set bit.
 #
-# Per-frame data: the first `tc` packed quats of each keyframe group block are
-# the tc bones' rotations at that group's frame (group*8).  Sub-frame detail
-# (the trailer bitmask) is not yet decoded, so this yields a correct-pose,
-# coarse-framerate (every 8th frame) animation — enough to validate routing.
+# Section[2] is historically named "RootRot" in this file, but that name is
+# misleading. It does not hold root motion. It is a constant-rotation palette
+# for bones that the clip poses once instead of keyframing every frame
+# (commonly facial/end/helper bones; sometimes clip-specific held poses).
+#
+# Real root motion is separate:
+#   UnkSec1 = root orientation curve
+#   UnkSec2 = root translation / trajectory curve
+#   Offsets = pelvis/body local translation curve
 
 def _qnorm(q):
     if q is None:
@@ -547,7 +563,7 @@ def parse_xbg_skeleton(xbg_path):
 
 
 def decode_root_rot_quats(d, sections):
-    """RootRot (sec[2]) -> list of normalised (w,x,y,z) constant rotations."""
+    """Section[2] ConstantRot/RootRot -> (w,x,y,z) constant rotations."""
     rr = sections.offsets['RootRot']
     if not rr:
         return []
@@ -561,6 +577,131 @@ def decode_root_rot_quats(d, sections):
         p += 6
         out.append(_qnorm(quat_xyzw_to_blender(q)) if q else None)
     return out
+
+
+def _curve_header(d, sections, name):
+    off = sections.offsets.get(name, 0)
+    size = sections.sizes.get(name, 0)
+    if not (off and size >= 8 and off + 8 <= len(d)):
+        return None
+    track_count, frame_count = struct.unpack_from('<HH', d, off)
+    sample_rate = struct.unpack_from('<I', d, off + 4)[0]
+    return {
+        'section': name,
+        'offset': off,
+        'size': size,
+        'track_count': track_count,
+        'frame_count': frame_count,
+        'sample_rate_or_unknown': sample_rate,
+    }
+
+
+def _candidate_sample_count(header, stride):
+    available = max(0, header['size'] - 8) // stride
+    # FC2 movement curves observed so far carry frames 0..frame_count,
+    # i.e. one terminal sample beyond the keyed rotation frame range.
+    wanted = header['frame_count'] + 1
+    if wanted <= 0 or wanted > available:
+        return available
+    return wanted
+
+
+def decode_candidate_root_orientation(d, sections):
+    """UnkSec1 candidate: one packed-quat curve for root-motion orientation.
+
+    Movement clips such as run-turn transitions contain frame_count+1 samples:
+    identity-ish values at the start, then a smooth yaw turn. This is not yet
+    applied by the importer; it is exposed for format research.
+    """
+    header = _curve_header(d, sections, 'UnkSec1')
+    if not header:
+        return None, []
+    count = _candidate_sample_count(header, 6)
+    p = header['offset'] + 8
+    samples = []
+    for frame in range(count):
+        q = read_quat(d, p + frame * 6)
+        samples.append((frame, q))
+    return header, samples
+
+
+def decode_candidate_vec3_curve(d, sections, name):
+    """Decode a candidate FC2 vec3 curve section.
+
+    UnkSec2 and Offsets both share the same small header as the candidate
+    root-orientation curve and then store frame_count+1 vec3 samples plus
+    padding in the supplied movement-transition clip.
+    """
+    header = _curve_header(d, sections, name)
+    if not header:
+        return None, []
+    count = _candidate_sample_count(header, 12)
+    p = header['offset'] + 8
+    samples = []
+    for frame in range(count):
+        if p + frame * 12 + 12 > len(d):
+            break
+        samples.append((frame, struct.unpack_from('<3f', d, p + frame * 12)))
+    return header, samples
+
+
+def decode_candidate_root_translation(d, sections):
+    """UnkSec2 candidate: likely root-motion translation/trajectory curve."""
+    return decode_candidate_vec3_curve(d, sections, 'UnkSec2')
+
+
+def decode_candidate_offsets(d, sections):
+    """Offsets candidate: likely pelvis/local offset curve."""
+    return decode_candidate_vec3_curve(d, sections, 'Offsets')
+
+
+def decode_candidate_offset_tracks(d, sections):
+    """Offsets candidate as routed vec3 tracks.
+
+    The FC2 movement clips observed so far have one translation track, stored
+    as frame_count+1 raw vec3 samples. If more tracks appear, this exposes them
+    in provisional frame-major order, matching the keyframe section's general
+    "all tracks for a frame" packing style.
+    """
+    header = _curve_header(d, sections, 'Offsets')
+    if not header:
+        return None, []
+    track_count = max(1, header['track_count'])
+    frame_count = header['frame_count'] + 1
+    max_vecs = max(0, header['size'] - 8) // 12
+    if frame_count <= 0:
+        frame_count = max_vecs // track_count
+    frame_count = min(frame_count, max_vecs // track_count)
+    p = header['offset'] + 8
+    tracks = [[] for _ in range(track_count)]
+    for frame in range(frame_count):
+        for ti in range(track_count):
+            off = p + (frame * track_count + ti) * 12
+            if off + 12 <= len(d):
+                tracks[ti].append((frame, struct.unpack_from('<3f', d, off)))
+    return header, tracks
+
+
+def decode_candidate_animated_translation_values(d, sections):
+    """UnkSec3 candidate: vec3 values routed by header mask @0x38.
+
+    The sample movement clip has one bit set in the animated-translation mask
+    and this section contains count=1 followed by one vec3 value. Treat as
+    provisional until validated against more clips/skeletons.
+    """
+    off = sections.offsets.get('UnkSec3', 0)
+    size = sections.sizes.get('UnkSec3', 0)
+    if not (off and size >= 8 and off + 8 <= len(d)):
+        return {'count': 0, 'offset': off, 'size': size}, []
+    count = struct.unpack_from('<I', d, off)[0]
+    pad0 = struct.unpack_from('<I', d, off + 4)[0]
+    max_count = max(0, size - 8) // 12
+    count = min(count, max_count)
+    p = off + 8
+    values = []
+    for i in range(count):
+        values.append(struct.unpack_from('<3f', d, p + i * 12))
+    return {'count': count, 'pad0': pad0, 'offset': off, 'size': size}, values
 
 
 def _stream_counts(d, sections):
@@ -581,15 +722,16 @@ def _stream_counts(d, sections):
 # 20-byte mask slots (up to 160 bones), validated on the corp skeleton
 # (93 bones) against walk/sprint/geton/getoff + sprint_upbody (2026-06-09):
 #   0x10 : constant-rotation mask — bit k (LSB-first) set means skeleton
-#          bone k takes its pose from RootRot; RootRot[j] = j-th set bit.
+#          bone k takes its pose from section[2]; entry j = j-th set bit.
 #   0x24 : animated-rotation mask — keyframe track t = t-th set bit.
-#   0x38 : animated-translation mask (UnkSec3 vec3 entries) — not consumed yet.
+#   0x38 : animated-translation mask — Offsets/UnkSec3 track t = t-th set bit.
 # Bones in neither rotation mask (twists, procedural pouches) are untouched.
 # DLL ground truth: routing loop at VA 0x1030FBD8 iterates skeleton bone
 # indices, tests bit edi in two masks, consumes the quat stream sequentially
 # for set bits.
 _MASK_CONST_OFF = 0x10
 _MASK_ANIM_OFF = 0x24
+_MASK_TRANS_OFF = 0x38
 _MASK_SLOT = 0x14   # 20 bytes per mask slot
 
 
@@ -699,6 +841,52 @@ def read_routing_masks(d, sections, n_bones):
     return None, None
 
 
+def _translation_track_count(d, sections):
+    h = _curve_header(d, sections, 'Offsets')
+    if h and h['track_count'] > 0:
+        return h['track_count']
+    info, values = decode_candidate_animated_translation_values(d, sections)
+    return info.get('count', len(values))
+
+
+def read_translation_mask(d, sections, n_bones):
+    """Read the per-clip animated-translation routing mask @0x38."""
+    tc = _translation_track_count(d, sections)
+    if tc <= 0 or n_bones <= 0 or n_bones > 8 * _MASK_SLOT:
+        return None
+    if _MASK_TRANS_OFF + _MASK_SLOT > len(d):
+        return None
+    bits = [(d[_MASK_TRANS_OFF + i // 8] >> (i % 8)) & 1
+            for i in range(n_bones)]
+    if sum(bits) == tc:
+        return bits
+    return None
+
+
+def find_translated_bones(d, sections, skel_names, bone_offset=0):
+    """Return translation-track bone names routed by header mask @0x38."""
+    trans_b = None
+    if bone_offset == 0:
+        trans_b = read_translation_mask(d, sections, len(skel_names))
+    if trans_b is None:
+        min_nb = bone_offset + len(skel_names)
+        start = max(min_nb, len(skel_names) + (1 if bone_offset == 0 else 0))
+        for nb in range(start, 8 * _MASK_SLOT + 1):
+            trans_b = read_translation_mask(d, sections, nb)
+            if trans_b is not None:
+                print("[MAB] translation mask domain is %d bones "
+                      "(model skeleton has %d at offset %d)"
+                      % (nb, len(skel_names), bone_offset))
+                break
+    if trans_b is None:
+        return []
+    names_ext = (['<pre:%d>' % i for i in range(bone_offset)]
+                 + list(skel_names))
+    names_ext += ['<other:%d>' % i
+                  for i in range(len(trans_b) - len(names_ext))]
+    return [nm for bit, nm in zip(trans_b, names_ext) if bit]
+
+
 def find_animated_bones(d, sections, skel_names, bone_offset=0):
     """Return (tc, [animated bone names], [constant bone names]) for this clip.
 
@@ -706,7 +894,7 @@ def find_animated_bones(d, sections, skel_names, bone_offset=0):
       * `skel_names` = bone names of the ANIMATION SKELETON (.skeleton/LKS
         resource) in file order — this is the mask bit domain.
       * Header mask @0x24 selects the keyframed bones: track t = t-th set bit.
-      * Header mask @0x10 selects the constant bones: RootRot[j] = j-th set
+      * Header mask @0x10 selects the constant bones: section[2][j] = j-th set
         bit.  Bones in neither mask are not touched by the clip.
       * `bone_offset` > 0 places this model's skeleton at that bit offset
         inside a scripted-scene COMBINED rig (several characters + anchors
@@ -874,13 +1062,106 @@ def _bulk_key_pose(action, pb, frames, quats, locs=None):
             fc.update()
 
 
+def _set_key_interpolation(action, obj, pb, prop_name, interpolation):
+    """Best-effort interpolation override for fcurves just written in bulk."""
+    try:
+        cont = _fcurve_container(obj, action)
+        path = f'{pb.path_from_id()}.{prop_name}'
+        for fc in cont.fcurves:
+            if fc.data_path == path:
+                for kp in fc.keyframe_points:
+                    kp.interpolation = interpolation
+                fc.update()
+    except Exception as exc:
+        print("[MAB] interpolation override skipped: %s" % exc)
+
+
+def _reset_armature_before_mab(arm_obj):
+    """Clear stale action state and restore pose bones to their rest basis."""
+    if arm_obj.animation_data is not None:
+        arm_obj.animation_data.action = None
+    ident = mathutils.Matrix.Identity(4) if mathutils is not None else None
+    for pb in arm_obj.pose.bones:
+        if ident is not None:
+            pb.matrix_basis = ident.copy()
+        else:
+            pb.location = (0.0, 0.0, 0.0)
+            pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+            pb.rotation_euler = (0.0, 0.0, 0.0)
+            pb.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+            pb.scale = (1.0, 1.0, 1.0)
+        for con in list(pb.constraints):
+            if con.name.startswith('MAB helper'):
+                pb.constraints.remove(con)
+
+
+def _lerp_vec3_samples(samples, frame):
+    if not samples:
+        return None
+    if frame <= samples[0][0]:
+        return samples[0][1]
+    if frame >= samples[-1][0]:
+        return samples[-1][1]
+    for i in range(len(samples) - 1):
+        f0, v0 = samples[i]
+        f1, v1 = samples[i + 1]
+        if f0 <= frame <= f1:
+            if f1 <= f0:
+                return v0
+            t = (frame - f0) / float(f1 - f0)
+            return (v0[0] + (v1[0] - v0[0]) * t,
+                    v0[1] + (v1[1] - v0[1]) * t,
+                    v0[2] + (v1[2] - v0[2]) * t)
+    return samples[-1][1]
+
+
+def _norm_bone_name(name):
+    return ''.join(c.lower() for c in name if c.isalnum())
+
+
+def _find_pelvis_bone_name(skel, pbones):
+    """Best-effort FC2 pelvis/hip bone lookup shared by translation fallback."""
+    pose_names = set(pbones.keys())
+    preferred = ('Pelvis', 'Hips', 'Hip', 'Bip01 Pelvis', 'Bip Pelvis')
+    for nm in preferred:
+        if nm in pose_names and any(b['name'] == nm for b in skel):
+            return nm
+
+    pose_norm = {_norm_bone_name(nm): nm for nm in pose_names}
+    for b in skel:
+        n = _norm_bone_name(b['name'])
+        if ('pelvis' in n or n.endswith('hips') or n.endswith('hip')):
+            hit = pose_norm.get(n)
+            if hit:
+                return hit
+
+    for b in skel:
+        n = _norm_bone_name(b['name'])
+        if 'pelvis' in n or 'hip' in n:
+            if b['name'] in pose_names:
+                return b['name']
+    return None
+
+
+def _skel_index_for_name(name, name2idx, skel):
+    """Resolve a pose/skeleton bone name to an XBG skeleton index."""
+    if name in name2idx:
+        return name2idx[name]
+    want = _norm_bone_name(name)
+    for i, b in enumerate(skel):
+        if _norm_bone_name(b['name']) == want:
+            return i
+    return None
+
+
 def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
                      skeleton_path=None, extra_dirs=(), bone_offset=0,
-                     emulate_helpers=True, smooth_resample=True,
-                     resample_fps=60, twist_bake=True):
+                     emulate_helpers=True, apply_root_motion=True,
+                     apply_bone_translation=True,
+                     smooth_resample=True, resample_fps=60, twist_bake=True):
     """Apply a multi-bone MAB using a convention-INDEPENDENT deformation method.
 
-    Track/RootRot routing comes from the MAB header masks over the ANIMATION
+    Track/constant-rotation routing comes from MAB header masks over the ANIMATION
     SKELETON's bone order (.skeleton file — auto-discovered next to the XBG
     when `skeleton_path` is not given).
 
@@ -925,6 +1206,8 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
     if skel_names:
         tc, animated, constant = find_animated_bones(
             d, sections, skel_names, bone_offset=bone_offset)
+        translated = find_translated_bones(
+            d, sections, skel_names, bone_offset=bone_offset)
     else:
         # No .skeleton file anywhere — last resort: try the routing masks
         # over the XBG's own bone order.  When the model and animation rig
@@ -944,6 +1227,7 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
         tc, _ = _stream_counts(d, sections)
         animated = [nm for bit, nm in zip(anim_b, xbg_names) if bit]
         constant = [nm for bit, nm in zip(const_b, xbg_names) if bit]
+        translated = find_translated_bones(d, sections, xbg_names)
     N, keys_by_idx = decode_full_keyframes(d, sections)
 
     def local_mat(quat_wxyz, pos):
@@ -984,17 +1268,103 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
         context.view_layer.objects.active = arm_obj
     if arm_obj.mode != 'POSE':
         bpy.ops.object.mode_set(mode='POSE')
+    _reset_armature_before_mab(arm_obj)
     if arm_obj.animation_data is None:
         arm_obj.animation_data_create()
     action = bpy.data.actions.new(name="MAB_multi")
     arm_obj.animation_data.action = action
     pbones = arm_obj.pose.bones
+    bone_translation_log = []
 
-    # Constant (RootRot) bones: RootRot[j] = j-th constant bone in mask order
+    def log_bone_translation(msg):
+        bone_translation_log.append(msg)
+        print("[MAB] " + msg)
+
+    # Constant-rotation bones: section[2][j] = j-th constant bone in mask order
     # (see find_animated_bones).  These hold a per-clip fixed pose — usually
     # near rest for the face, posed for held hands/arms.
     rr_quats = decode_root_rot_quats(d, sections)   # (w,x,y,z), index-aligned
     const_bones = [(nm, q) for nm, q in zip(constant, rr_quats) if q is not None]
+
+    root_motion_name = None
+    root_motion_rot = []
+    root_motion_pos = []
+    if apply_root_motion and skel:
+        cand_name = skel[0]['name']
+        if cand_name in pbones:
+            _, root_motion_rot_raw = decode_candidate_root_orientation(d, sections)
+            _, root_motion_pos = decode_candidate_root_translation(d, sections)
+            root_motion_rot = [(fr, quat_xyzw_to_blender(q))
+                               for fr, q in root_motion_rot_raw if q is not None]
+            if root_motion_rot or root_motion_pos:
+                root_motion_name = cand_name
+                print("[MAB] candidate root motion: applying %d rot + %d loc "
+                      "samples to first XBG bone %r"
+                      % (len(root_motion_rot), len(root_motion_pos),
+                         root_motion_name))
+
+    bone_translation = {}
+    if apply_bone_translation:
+        _, offset_tracks = decode_candidate_offset_tracks(d, sections)
+        if not offset_tracks:
+            _info, static_values = decode_candidate_animated_translation_values(
+                d, sections)
+            offset_tracks = [[(0, v)] for v in static_values]
+        unresolved = []
+        if translated and offset_tracks:
+            for ti, nm in enumerate(translated):
+                if ti >= len(offset_tracks):
+                    break
+                routed_nm = nm
+                if _norm_bone_name(nm) == 'camera':
+                    # FC2 body clips route the only vec3 translation track to
+                    # the Head child "Camera" even in third-person clips
+                    # (verified: pelvis_ref.skeleton bit 17 on 1stge/3rdge
+                    # fall and turn clips). For body playback in Blender,
+                    # retarget that view-carrier motion to Pelvis.
+                    pelvis = _find_pelvis_bone_name(skel, pbones)
+                    if pelvis:
+                        nm = pelvis
+                        log_bone_translation(
+                            "candidate bone translation: track %d routed to "
+                            "'Camera'; redirecting to %r for body/pelvis "
+                            "playback" % (ti, nm))
+                if nm == root_motion_name:
+                    log_bone_translation(
+                        "candidate bone translation: track %d routed to root "
+                        "%r; skipped because root motion owns it" % (ti, nm))
+                    continue
+                if (nm in pbones and
+                        _skel_index_for_name(nm, name2idx, skel) is not None
+                        and offset_tracks[ti]):
+                    bone_translation[nm] = offset_tracks[ti]
+                    log_bone_translation(
+                        "candidate bone translation: track %d -> %r "
+                        "(%d samples, %s)"
+                        % (ti, nm, len(offset_tracks[ti]),
+                           "camera-redirect" if nm != routed_nm else "mask-routed"))
+                else:
+                    unresolved.append((ti, nm))
+                    log_bone_translation(
+                        "candidate bone translation: track %d routed to %r, "
+                        "but that name is not a usable pose/XBG bone"
+                        % (ti, nm))
+
+        if offset_tracks and not bone_translation:
+            pelvis = _find_pelvis_bone_name(skel, pbones)
+            if pelvis and pelvis != root_motion_name:
+                bone_translation[pelvis] = offset_tracks[0]
+                reason = ("fallback from %r" % unresolved[0][1]
+                          if unresolved else "single-track pelvis fallback")
+                log_bone_translation(
+                    "candidate bone translation: track 0 -> %r "
+                    "(%d samples, %s)"
+                    % (pelvis, len(offset_tracks[0]), reason))
+            elif offset_tracks:
+                log_bone_translation(
+                    "candidate bone translation: %d track(s) decoded, "
+                    "but no pelvis/hip pose bone could be matched"
+                    % len(offset_tracks))
 
     # Engine exclusion: AVATAR XBG bones with iB == -1 are PROCEDURAL
     # (twist roots, the model root).  The MAB still carries rig tracks for
@@ -1020,8 +1390,9 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
 
     # cache Blender rest matrix_local for every bone we will pose
     ml = {}
-    for nm in list(animated) + [nm for nm, _ in const_bones]:
-        if nm in pbones:
+    for nm in (list(animated) + [nm for nm, _ in const_bones]
+               + [root_motion_name] + list(bone_translation)):
+        if nm and nm in pbones:
             ml[nm] = pbones[nm].bone.matrix_local.copy()
 
     keyed = set()
@@ -1092,8 +1463,172 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             if src_fps > 0:
                 mult = max(1, min(8, int(round(resample_fps / src_fps))))
 
+    def key_root_motion():
+        nonlocal last_frame
+        nm = root_motion_name
+        if not nm or nm not in pbones or nm not in ml or nm not in name2idx:
+            return False
+        i = name2idx[nm]
+        p = parents[i]
+        mli = ml[nm]
+        mli_inv = mli.inverted()
+        bwp = bind_world[p] if (p is not None and 0 <= p < len(bind_world)) else ident
+        bw_inv = bind_world[i].inverted()
+        rest_q = skel[i]['quat']
+        rest_pos = skel[i]['pos']
+
+        rot_keys = list(root_motion_rot)
+        if rot_keys:
+            rot_keys = resample_rotation(rot_keys, mult)
+
+        if rot_keys:
+            out_frames = [fr for fr, _q in rot_keys]
+            q_by_frame = {fr: q for fr, q in rot_keys}
+        elif root_motion_pos:
+            f0 = int(round(root_motion_pos[0][0] * max(1, mult)))
+            f1 = int(round(root_motion_pos[-1][0] * max(1, mult)))
+            out_frames = list(range(f0, f1 + 1))
+            q_by_frame = {}
+        else:
+            return False
+
+        pb = pbones[nm]
+        pb.rotation_mode = 'QUATERNION'
+        frames = []
+        quats = []
+        locs = []
+        prev = None
+        scale = float(max(1, mult))
+        for out_frame in out_frames:
+            src_frame = out_frame / scale
+            q = q_by_frame.get(out_frame, rest_q)
+            pos = _lerp_vec3_samples(root_motion_pos, src_frame)
+            if pos is None:
+                pos = rest_pos
+            basis = mli_inv @ (bwp @ local_mat(q, pos) @ bw_inv) @ mli
+            loc, qq, _ = basis.decompose()
+            if prev is not None and prev.dot(qq) < 0.0:
+                qq.negate()
+            prev = qq
+            frames.append(out_frame + 1)
+            quats.append(qq)
+            locs.append(loc)
+        _bulk_key_pose(action, pb, frames, quats, locs)
+        _set_key_interpolation(action, arm_obj, pb, 'location', 'LINEAR')
+        last_frame = max(last_frame, frames[-1])
+        return True
+
+    def eval_wxyz_keys(rot_keys, frame, default_q):
+        if not rot_keys:
+            return default_q
+        if frame <= rot_keys[0][0]:
+            return rot_keys[0][1]
+        if frame >= rot_keys[-1][0]:
+            return rot_keys[-1][1]
+        for ri in range(len(rot_keys) - 1):
+            f0, q0 = rot_keys[ri]
+            f1, q1 = rot_keys[ri + 1]
+            if f0 <= frame <= f1:
+                if f1 <= f0:
+                    return q0
+                t = (frame - f0) / float(f1 - f0)
+                a = Quat(q0)
+                b = Quat(q1)
+                if a.dot(b) < 0.0:
+                    b.negate()
+                qq = a.slerp(b, t)
+                return (qq.w, qq.x, qq.y, qq.z)
+        return rot_keys[-1][1]
+
+    anim_index = {nm: bi for bi, nm in enumerate(animated)}
+    anim_index_norm = {_norm_bone_name(nm): bi for bi, nm in enumerate(animated)}
+    const_lookup = {nm: bq for nm, bq in const_bones}
+    const_lookup_norm = {_norm_bone_name(nm): bq for nm, bq in const_bones}
+
+    def key_translated_bone(nm, pos_samples):
+        nonlocal last_frame
+        if nm in procedural:
+            return False
+        if nm not in pbones or nm not in ml:
+            return False
+        i = _skel_index_for_name(nm, name2idx, skel)
+        if i is None:
+            log_bone_translation(
+                "candidate bone translation: %r has no matching XBG "
+                "skeleton index; no keys written" % nm)
+            return False
+        p = parents[i]
+        mli = ml[nm]
+        mli_inv = mli.inverted()
+        bwp = bind_world[p] if (p is not None and 0 <= p < len(bind_world)) else ident
+        bw_inv = bind_world[i].inverted()
+        nkey = _norm_bone_name(nm)
+        rest_q = const_lookup.get(nm, const_lookup_norm.get(nkey, skel[i]['quat']))
+        rest_pos = skel[i]['pos']
+
+        rot_keys = []
+        bi = anim_index.get(nm)
+        if bi is None:
+            bi = anim_index_norm.get(nkey)
+        if bi is not None:
+            rot_keys = [(fr, quat_xyzw_to_blender(q))
+                        for fr, q in keys_by_idx.get(bi, []) if q is not None]
+            if rot_keys:
+                rot_keys = resample_rotation(rot_keys, mult)
+
+        scale = float(max(1, mult))
+        if pos_samples:
+            f0 = int(round(pos_samples[0][0] * scale))
+            f1 = int(round(pos_samples[-1][0] * scale))
+            out_frames = list(range(f0, f1 + 1)) if f1 >= f0 else [f0]
+        elif rot_keys:
+            out_frames = [fr for fr, _q in rot_keys]
+        else:
+            return False
+
+        pb = pbones[nm]
+        pb.rotation_mode = 'QUATERNION'
+        frames = []
+        quats = []
+        locs = []
+        prev = None
+        for out_frame in out_frames:
+            src_frame = out_frame / scale
+            q = eval_wxyz_keys(rot_keys, out_frame, rest_q)
+            pos = _lerp_vec3_samples(pos_samples, src_frame)
+            if pos is None:
+                pos = rest_pos
+            basis = mli_inv @ (bwp @ local_mat(q, pos) @ bw_inv) @ mli
+            loc, qq, _ = basis.decompose()
+            if prev is not None and prev.dot(qq) < 0.0:
+                qq.negate()
+            prev = qq
+            frames.append(out_frame + 1)
+            quats.append(qq)
+            locs.append(loc)
+        _bulk_key_pose(action, pb, frames, quats, locs)
+        _set_key_interpolation(action, arm_obj, pb, 'location', 'LINEAR')
+        last_frame = max(last_frame, frames[-1])
+        if frames:
+            log_bone_translation(
+                "keyed translated bone %r: %d rot+loc keys, first_loc=%s "
+                "last_loc=%s"
+                % (nm, len(frames), tuple(locs[0]), tuple(locs[-1])))
+        return True
+
+    if key_root_motion():
+        keyed.add(root_motion_name)
+
+    for nm, samples in bone_translation.items():
+        if key_translated_bone(nm, samples):
+            keyed.add(nm)
+
     # Animated bones: full keyframe streams (track bi belongs to animated[bi]).
     for bi in range(min(N, len(animated))):
+        if root_motion_name and animated[bi] == root_motion_name:
+            continue
+        if animated[bi] in bone_translation:
+            continue
         keys = [(fr, quat_xyzw_to_blender(q))
                 for fr, q in keys_by_idx.get(bi, []) if q is not None]
         if mult > 1 and len(keys) >= 2:
@@ -1101,8 +1636,12 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
         if key_bone(animated[bi], keys):
             keyed.add(animated[bi])
 
-    # Constant bones: a single key at frame 1 holds the RootRot pose.
+    # Constant bones: a single key at frame 1 holds the section[2] pose.
     for nm, bq in const_bones:
+        if root_motion_name and nm == root_motion_name:
+            continue
+        if nm in bone_translation:
+            continue
         if key_bone(nm, [(0, bq)]):
             keyed.add(nm)
 
@@ -1142,6 +1681,15 @@ def apply_multi_bone(context, d, sections, arm_obj, xbg_path,
             log=print,
             bake=twist_bake, context=context,
             frame_start=1, frame_end=last_frame)
+
+    if bone_translation_log:
+        arm_obj['mab_last_bone_translation'] = ' | '.join(bone_translation_log[-4:])
+    elif apply_bone_translation:
+        arm_obj['mab_last_bone_translation'] = (
+            "candidate bone translation: no routed/fallback track was keyed")
+    else:
+        arm_obj['mab_last_bone_translation'] = (
+            "candidate bone translation: disabled")
 
     scene = context.scene
     scene.frame_start = 1
@@ -1200,6 +1748,32 @@ def _main_cli(argv):
             eus = "(%7.2f,%7.2f,%7.2f)" % eu if eu else "None"
             print(f"    tuple[{ti}] euler={eus} mask=0x{tp['mask']:04X} "
                   f"extra={len(tp['extra'])}")
+
+    h, root_orient = decode_candidate_root_orientation(d, sec)
+    if h and root_orient:
+        first = _euler_from_xyzw(root_orient[0][1])
+        last = _euler_from_xyzw(root_orient[-1][1])
+        print(f"\nCandidate root orientation ({h['section']}): "
+              f"{len(root_orient)} samples")
+        if first and last:
+            print("  first_euler=(%7.2f,%7.2f,%7.2f) "
+                  "last_euler=(%7.2f,%7.2f,%7.2f)"
+                  % (first + last))
+
+    for label, decoder in (("root translation", decode_candidate_root_translation),
+                           ("offset/pelvis", decode_candidate_offsets)):
+        h, samples = decoder(d, sec)
+        if h and samples:
+            print(f"\nCandidate {label} ({h['section']}): {len(samples)} samples")
+            print("  first=(% .6f,% .6f,% .6f) last=(% .6f,% .6f,% .6f)"
+                  % (samples[0][1] + samples[-1][1]))
+
+    info, trans_values = decode_candidate_animated_translation_values(d, sec)
+    if trans_values:
+        print(f"\nCandidate animated translation values (UnkSec3): "
+              f"{len(trans_values)} values")
+        for i, v in enumerate(trans_values[:8]):
+            print("  [%d] (% .6f,% .6f,% .6f)" % ((i,) + v))
 
 
 if __name__ == '__main__':

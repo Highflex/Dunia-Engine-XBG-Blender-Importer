@@ -313,6 +313,22 @@ class XBGDebugSettings(bpy.types.PropertyGroup):
                     "it leaks the bend and only approximates)",
         default=True
     )
+    mab_apply_root_motion: bpy.props.BoolProperty(
+        name="Apply Candidate Root Motion",
+        description="FC2 research option: apply the newly identified MAB "
+                    "root-orientation/root-translation candidate curves to "
+                    "the first XBG bone. Disable if the rig moves twice or "
+                    "the clip uses these sections for something else",
+        default=True
+    )
+    mab_apply_bone_translation: bpy.props.BoolProperty(
+        name="Apply Candidate Bone Translation",
+        description="FC2 research option: apply the 0x38 translation-mask "
+                    "track, currently observed as the pelvis/local offset "
+                    "curve in the Offsets section. Disable if the pelvis "
+                    "moves twice or the clip uses this stream differently",
+        default=True
+    )
     mab_smooth_resample: bpy.props.BoolProperty(
         name="Smooth Playback (SQUAD resample)",
         description="The engine stores spline-compressed rotation and "
